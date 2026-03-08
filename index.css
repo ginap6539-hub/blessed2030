@@ -1,0 +1,261 @@
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { User, CmsContent, Order } from './types';
+import { authService, cmsService, ecommerceService } from './services/supabaseService';
+import Layout from './components/Layout';
+import HomePage from './components/HomePage';
+import AuthWizard from './components/AuthWizard';
+import MemberPortal from './components/MemberPortal';
+import { AdminPanel } from './components/AdminPanel';
+import SocialHub from './components/SocialHub';
+import AboutPage from './components/AboutPage';
+import TeamPage from './components/TeamPage';
+import ContactPage from './components/ContactPage';
+import { INITIAL_CMS_CONTENT } from './constants';
+import { ShieldCheck, Package } from 'lucide-react';
+
+type ViewName = 'home' | 'auth' | 'portal' | 'about' | 'team' | 'contact' | 'social' | 'public_profile' | 'migrate';
+type ViewState = ViewName | { view: ViewName; tab?: string };
+
+const App: React.FC = () => {
+  const [user, setUser] = useState<User | null>(null);
+  const userRef = useRef<User | null>(null);
+  
+  useEffect(() => {
+    userRef.current = user;
+  }, [user]);
+
+  const [cmsContent, setCmsContent] = useState<CmsContent>(INITIAL_CMS_CONTENT);
+  const [viewState, setViewState] = useState<ViewState>('home');
+  const [showAdmin, setShowAdmin] = useState(() => {
+    return localStorage.getItem('blessed_admin_unlocked') === 'true';
+  });
+  const [scannedUserId, setScannedUserId] = useState<string | null>(null);
+  const [isInitializing, setIsInitializing] = useState(false); // Disabled blocking init
+  const watchIdRef = useRef<number | null>(null);
+
+  const startLocationWatch = useCallback((userId: string) => {
+    if (!navigator.geolocation) return;
+    
+    // Clear existing watch if any
+    if (watchIdRef.current !== null) {
+      navigator.geolocation.clearWatch(watchIdRef.current);
+    }
+
+    // "Every second" - watchPosition updates as fast as the hardware allows
+    watchIdRef.current = navigator.geolocation.watchPosition(
+      async (pos) => {
+        try {
+          await authService.updateUser(userId, { 
+            last_lat: pos.coords.latitude, 
+            last_lng: pos.coords.longitude, 
+            last_active: new Date().toISOString() 
+          });
+        } catch (e) {
+          console.error("Location sync fault:", e);
+        }
+      },
+      (err) => console.error("Geo error:", err),
+      { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 }
+    );
+  }, []);
+
+  const handleNavigation = (targetView: ViewState) => {
+      window.scrollTo(0, 0);
+      setViewState(targetView);
+  }
+
+  useEffect(() => {
+    // Handle initial hash and hash changes for simple routing
+    const handleHashChange = () => {
+      const hash = window.location.hash.replace('#', '');
+      if (hash === 'home') {
+        setViewState('home');
+      } else if (hash === 'about') {
+        setViewState('about');
+      } else if (hash === 'team') {
+        setViewState('team');
+      } else if (hash === 'contact') {
+        setViewState('contact');
+      }
+    };
+
+    handleHashChange();
+    window.addEventListener('hashchange', handleHashChange);
+    
+    // Non-blocking initialization
+    const loadBackgroundData = async () => {
+      try {
+        // Load CMS Content
+        cmsService.getContent().then(freshCms => {
+            if (freshCms) setCmsContent(prev => ({ ...prev, ...freshCms }));
+        }).catch(err => console.warn("Background CMS Load Error:", err));
+
+        // Subscribe to CMS changes
+        const unsubCms = cmsService.subscribe((freshCms) => {
+          if (freshCms) setCmsContent(prev => ({ ...prev, ...freshCms }));
+        });
+
+        // Load User Session
+        authService.getCurrentUser().then(currentUser => {
+            if (currentUser) {
+              setUser(currentUser);
+              authService.updateUser(currentUser.id, { is_online: true }).catch(console.error);
+              startLocationWatch(currentUser.id);
+              // Only navigate if we are on home/auth, otherwise respect current view
+              setViewState(prev => (prev === 'home' || prev === 'auth') ? 'social' : prev);
+            }
+        }).catch(err => console.warn("Background Auth Load Error:", err));
+
+        return unsubCms;
+      } catch (err) { 
+        console.error("Background Sync Fault:", err); 
+        return () => {};
+      }
+    };
+    
+    let unsubCms: () => void = () => {};
+    loadBackgroundData().then(unsub => {
+      if (unsub) unsubCms = unsub;
+    });
+
+    // Handle tab closure/refresh to set offline
+    const handleBeforeUnload = () => {
+      if (userRef.current) {
+        authService.updateUser(userRef.current.id, { is_online: false });
+      }
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+
+    // Real-time profile sync for balance and status
+    const unsubProfile = authService.subscribe(async () => {
+      const currentUser = await authService.getCurrentUser();
+      if (currentUser) setUser(currentUser);
+    });
+
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('verify')) {
+      setScannedUserId(params.get('verify'));
+      handleNavigation('public_profile');
+    }
+
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+      if (watchIdRef.current !== null) {
+        navigator.geolocation.clearWatch(watchIdRef.current);
+      }
+      unsubProfile();
+      unsubCms();
+    };
+  }, [startLocationWatch]);
+
+  // Handle Order Notifications Real-time
+  useEffect(() => {
+    if (!user) return;
+    const unsubOrders = ecommerceService.subscribeToOrders(async () => {
+      const orders = await ecommerceService.getOrders(user.id);
+      const shippedOrder = orders.find(o => o.status === 'SHIPPED');
+      if (shippedOrder) {
+         // Logic to prevent multiple alerts for the same shipment would usually go here
+         alert("BLESSED SYSTEM ALERT: Your parcel is on the way!");
+      }
+    });
+    return () => unsubOrders();
+  }, [user]);
+
+  const handleLogout = async () => {
+    if (watchIdRef.current !== null) {
+      navigator.geolocation.clearWatch(watchIdRef.current);
+    }
+    
+    if (user) {
+      try {
+        await authService.updateUser(user.id, { is_online: false });
+      } catch (e) {
+        console.warn("Offline sync failed", e);
+      }
+    }
+
+    // Force local cleanup first
+    setUser(null);
+    
+    try {
+        await authService.logout();
+    } catch (e) {
+        console.warn("Logout server sync failed, but local session cleared.", e);
+    }
+    
+    handleNavigation('home');
+  };
+
+  if (isInitializing) return (
+    <div className="h-screen bg-slate-900 flex flex-col items-center justify-center animate-pulse gap-6">
+      <img src={cmsContent.logoUrl} className="w-24 h-24 object-contain" alt="Sync" referrerPolicy="no-referrer" />
+      <p className="text-white font-black uppercase tracking-[0.3em] text-[10px]">Initializing Blessed Access...</p>
+    </div>
+  );
+  
+  const currentView = typeof viewState === 'string' ? viewState : viewState.view;
+  const initialTab = typeof viewState === 'object' ? viewState.tab : undefined;
+
+  return (
+    <Layout 
+      user={user} 
+      cms={cmsContent} 
+      onLogout={handleLogout} 
+      onAdminUnlock={() => setShowAdmin(true)} 
+      onNavigate={handleNavigation}
+    >
+      {currentView === 'home' && <HomePage cms={cmsContent} onEnter={() => user ? handleNavigation('social') : handleNavigation('auth')} />}
+      {currentView === 'auth' && <AuthWizard onComplete={(u) => { setUser(u || null); if (u) { startLocationWatch(u.id); handleNavigation('social'); } }} cms={cmsContent} />}
+      {currentView === 'portal' && user && <MemberPortal user={user} onProfileUpdate={() => authService.getCurrentUser().then(setUser)} onLogout={handleLogout} lat={null} lng={null} initialTab={initialTab} />}
+      {currentView === 'social' && user && <SocialHub user={user} onNavigate={handleNavigation} onPostShared={() => {}} />}
+      {currentView === 'about' && <AboutPage cms={cmsContent} />}
+      {currentView === 'team' && <TeamPage cms={cmsContent} />}
+      {currentView === 'contact' && <ContactPage cms={cmsContent} />}
+      {currentView === 'public_profile' && <PublicProfilePage userId={scannedUserId} cms={cmsContent} />}
+      {showAdmin && <AdminPanel currentCms={cmsContent} onClose={() => {
+        setShowAdmin(false);
+        localStorage.removeItem('blessed_admin_unlocked');
+      }} />}
+    </Layout>
+  );
+};
+
+const PublicProfilePage = ({ userId, cms }: { userId: string | null, cms: CmsContent }) => {
+  const [profile, setProfile] = useState<User | null>(null);
+  const [loading, setLoading] = useState(true);
+  useEffect(() => { 
+    if (userId) authService.getUserProfileById(userId).then(p => { setProfile(p as any); setLoading(false); }); 
+  }, [userId]);
+  
+  if (loading) return <div className="h-screen flex items-center justify-center bg-slate-900"><p className="text-white uppercase font-black tracking-widest text-[10px] animate-pulse">Verifying Member ID...</p></div>;
+  if (!profile) return <div className="h-screen flex items-center justify-center bg-slate-900 text-white font-black uppercase">Invalid Member ID: Authorization Refused.</div>;
+
+  return (
+    <div className="min-h-screen bg-slate-950 flex items-center justify-center p-4">
+      <div className="relative z-10 w-full max-w-lg bg-white rounded-[3rem] p-12 text-center shadow-2xl animate-fade-in overflow-hidden border">
+        <div className={`absolute top-0 inset-x-0 h-40 ${profile.is_exclusive ? 'bg-[#003366]' : 'bg-blue-600'}`}></div>
+        <div className="relative z-20">
+            <img src={profile.avatar_url || `https://ui-avatars.com/api/?name=${profile.first_name}`} className="w-48 h-48 rounded-full border-8 border-white mx-auto mb-6 object-cover bg-white shadow-xl" />
+            <h1 className="text-3xl font-serif font-black uppercase tracking-tight text-slate-900">{profile.first_name} {profile.last_name}</h1>
+            <p className="text-[#FFC107] font-black uppercase tracking-[0.3em] text-[10px] mt-2 bg-slate-900 inline-block px-4 py-1 rounded-full">{profile.membership_status} Member Verified</p>
+            <div className="grid grid-cols-2 gap-4 mt-12 text-left">
+                <div className="bg-slate-50 p-6 rounded-3xl border"><p className="text-[8px] font-black text-slate-400 uppercase tracking-widest">Blessed ID</p><p className="text-sm font-black text-slate-800 uppercase">{profile.blessed_id}</p></div>
+                <div className="bg-slate-50 p-6 rounded-3xl border"><p className="text-[8px] font-black text-slate-400 uppercase tracking-widest">Region Member</p><p className="text-sm font-black text-slate-800 uppercase">{profile.region}</p></div>
+                <div className="bg-slate-50 p-6 rounded-3xl border col-span-2"><p className="text-[8px] font-black text-slate-400 uppercase tracking-widest">Official Residence</p><p className="text-xs font-black text-slate-800 uppercase leading-relaxed">{profile.address}</p></div>
+                <div className="bg-slate-50 p-6 rounded-3xl border col-span-2"><p className="text-[8px] font-black text-slate-400 uppercase tracking-widest">Contact Phone</p><p className="text-xs font-black text-slate-800 uppercase">{profile.phone || 'PROTECTED LINK'}</p></div>
+            </div>
+             <div className="mt-8">
+                <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest text-center my-2">Official Member Logo</p>
+                <div className="w-40 h-40 mx-auto rounded-2xl border-4 border-white shadow-md bg-slate-100 p-2">
+                    <img src={profile.member_logo_url || cms.movementLogo} alt="Member Logo" className="w-full h-full object-contain"/>
+                </div>
+            </div>
+            <div className="mt-12 flex items-center justify-center gap-2 text-[9px] font-black text-slate-400 uppercase tracking-widest"><ShieldCheck size={14} className="text-amber-500" /> Authorized Registry Registry v7.1</div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default App;

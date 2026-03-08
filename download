@@ -1,0 +1,780 @@
+import { createClient } from '@supabase/supabase-js';
+
+// SUPABASE CONFIGURATION
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || 'https://knzwncgllcoyjoxwpicy.supabase.co';
+const SUPABASE_KEY = import.meta.env.VITE_SUPABASE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtuenduY2dsbGNveWpveHdwaWN5Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjYxNjE5MywiZXhwIjoyMDg4MTkyMTkzfQ.PWwn3OFuEtaSNeEmW3EhmY6TqK1lKb_LLlNV2G6n4RI';
+
+export const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+// Admin Client for bypassing email confirmation and managing users
+const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_KEY, {
+    auth: {
+        autoRefreshToken: false,
+        persistSession: false
+    }
+});
+
+// --- CMS SERVICE ---
+export const cmsService = {
+    getContent: async () => {
+        const { data } = await supabase.from('website_content').select('*').limit(1).single();
+        if (data) return data.content;
+        return null;
+    },
+
+    updateContent: async (content: any) => {
+        const { data, error: fetchError } = await supabase.from('website_content').select('id').limit(1);
+        if (fetchError) throw fetchError;
+
+        if (data && data.length > 0) {
+            const { error: updateError } = await supabase.from('website_content').update({ content: content }).eq('id', data[0].id);
+            if (updateError) throw updateError;
+        } else {
+            const { error: insertError } = await supabase.from('website_content').insert({ id: 'main', content: content });
+            if (insertError) throw insertError;
+        }
+    },
+
+    subscribe: (callback: (data: any) => void) => {
+        const channel = supabase.channel('public:website_content')
+            .on('postgres_changes', { event: '*', schema: 'public', table: 'website_content' }, (payload) => {
+                if (payload.new && (payload.new as any).content) {
+                    callback((payload.new as any).content);
+                }
+            })
+            .subscribe();
+        return () => { supabase.removeChannel(channel); };
+    }
+};
+
+// --- AUTH SERVICE ---
+export const authService = {
+    login: async (email: string, password: string) => {
+        const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+        if (error) throw error;
+        return authService.getCurrentUser();
+    },
+
+    register: async (data: any) => {
+        const { email, password, firstName, middleName, lastName, position, region, avatarUrl, memberLogoUrl, address, phone, lat, lng } = data;
+        
+        // 1. Check if user already exists in auth
+        let userId: string | null = null;
+        
+        const { data: authData, error: signUpError } = await supabaseAdmin.auth.admin.createUser({
+            email,
+            password,
+            email_confirm: true, // AUTO-CONFIRM
+            user_metadata: {
+                first_name: firstName,
+                last_name: lastName,
+                full_name: `${firstName} ${lastName}`
+            }
+        });
+        
+        if (signUpError) {
+            // If user already exists, try to find them
+            if (signUpError.message.includes('already registered') || signUpError.message.includes('already exists')) {
+                const { data: usersData, error: listError } = await supabaseAdmin.auth.admin.listUsers();
+                if (listError) throw listError;
+                const existingUser = (usersData.users as any[]).find((u: any) => u.email === email);
+                if (existingUser) {
+                    userId = existingUser.id;
+                } else {
+                    throw signUpError;
+                }
+            } else {
+                throw signUpError;
+            }
+        } else {
+            userId = authData.user.id;
+        }
+        
+        if (!userId) throw new Error("Authentication failed: User ID not found.");
+        
+        // 2. Check if Profile exists
+        const { data: existingProfile } = await supabase
+            .from('profiles')
+            .select('id')
+            .eq('id', userId)
+            .single();
+
+        if (existingProfile) {
+            throw new Error("User already registered with a complete profile. Please login instead.");
+        }
+
+        // 3. Create Profile
+        const newProfile = {
+            id: userId,
+            email,
+            role: email === 'admin@blessed.ph' ? 'ADMIN' : 'MEMBER',
+            first_name: firstName,
+            middle_name: middleName,
+            last_name: lastName,
+            position: position,
+            region: region,
+            avatar_url: avatarUrl,
+            member_logo_url: memberLogoUrl,
+            address: address,
+            phone: phone,
+            wallet_balance: 0,
+            is_online: true,
+            last_active: new Date().toISOString(),
+            last_lat: lat,
+            last_lng: lng,
+            joined_at: new Date().toISOString()
+        };
+
+        const { error: profileError } = await supabase
+            .from('profiles')
+            .insert(newProfile);
+
+        if (profileError) {
+            console.error("Profile creation fault:", profileError);
+            throw new Error(`Profile creation failed: ${profileError.message}`);
+        }
+
+        // 4. Log in the user locally
+        const { data: loginData, error: loginError } = await supabase.auth.signInWithPassword({
+            email,
+            password
+        });
+        
+        if (loginError) throw loginError;
+        return authService.getCurrentUser();
+    },
+
+    logout: async () => {
+        await supabase.auth.signOut();
+    },
+
+    getCurrentUser: async () => {
+        const { data: { user } } = await supabase.auth.getUser();
+        if (!user) return null;
+        
+        const { data: profile, error } = await supabase
+            .from('profiles')
+            .select('*')
+            .eq('id', user.id)
+            .single();
+            
+        if (!profile && user.email === 'admin@blessed.ph') {
+            // Auto-create admin profile if it doesn't exist
+            const newProfile = {
+                id: user.id,
+                email: user.email,
+                role: 'ADMIN',
+                first_name: 'System',
+                last_name: 'Admin',
+                wallet_balance: 0,
+                is_online: true,
+                joined_at: new Date().toISOString()
+            };
+            await supabase.from('profiles').insert(newProfile);
+            return { ...newProfile, email: user.email };
+        }
+            
+        return profile ? { ...profile, email: user.email } : null;
+    },
+
+    getUserProfileById: async (userId: string) => {
+        const { data } = await supabase.from('profiles').select('*').eq('id', userId).single();
+        return data;
+    },
+
+    getAdminProfile: async () => {
+        const { data } = await supabase.from('profiles').select('*').eq('email', 'admin@blessed.ph').maybeSingle();
+        return data;
+    },
+
+    updateUser: async (userId: string, updates: any) => {
+        await supabase.from('profiles').update(updates).eq('id', userId);
+    },
+
+    getAllUsers: async () => {
+        const { data } = await supabase.from('profiles').select('*, last_lat, last_lng');
+        return data || [];
+    },
+    
+    getTotalUserCount: async () => {
+        const { count } = await supabase.from('profiles').select('*', { count: 'exact', head: true });
+        return count || 0;
+    },
+
+    getOnlineUsers: async () => {
+        const { data, count } = await supabase
+            .from('profiles')
+            .select('*', { count: 'exact' })
+            .eq('is_online', true);
+        return data || [];
+    },
+
+    searchUsers: async (term: string) => {
+        const { data } = await supabase
+            .from('profiles')
+            .select('*')
+            .or(`email.ilike.%${term}%,first_name.ilike.%${term}%,last_name.ilike.%${term}%,wallet_code.ilike.%${term}%`)
+            .limit(50);
+        return data || [];
+    },
+
+    forgotPassword: async (email: string) => {
+        await supabase.auth.resetPasswordForEmail(email, {
+            redirectTo: `${window.location.origin}/auth/reset-password`,
+        });
+    },
+
+    adminResetPassword: async (userId: string, newPass: string) => {
+        const { error } = await supabase.auth.admin.updateUserById(userId, { password: newPass });
+        if (error) throw error;
+    },
+
+    subscribe: (callback: () => void) => {
+        const channel = supabase.channel('public:profiles')
+            .on('postgres_changes', { event: '*', schema: 'public', table: 'profiles' }, callback)
+            .subscribe();
+        return () => { supabase.removeChannel(channel); };
+    }
+};
+
+// --- SOCIAL SERVICE ---
+export const socialService = {
+    getFeedPosts: async (userId?: string) => {
+        // AUTO-CLEANUP: Delete posts older than 2 days
+        const twoDaysAgo = new Date();
+        twoDaysAgo.setDate(twoDaysAgo.getDate() - 2);
+        await supabase.from('posts').delete().lt('created_at', twoDaysAgo.toISOString());
+
+        let query = supabase.from('posts').select(`
+            *,
+            author:profiles(id, first_name, last_name, avatar_url, region),
+            likes(id, user_id),
+            comments(
+                id,
+                content,
+                created_at,
+                author:profiles(id, first_name, last_name, avatar_url)
+            )
+        `).order('created_at', { ascending: false }).limit(50);
+        
+        if (userId) query = query.eq('user_id', userId);
+        const { data } = await query;
+        return data || [];
+    },
+
+    createPost: async (post: any) => {
+        await supabase.from('posts').insert({
+            user_id: post.user_id,
+            content: post.content,
+            image_url: post.image_url,
+            created_at: new Date().toISOString()
+        });
+    },
+
+    deletePost: async (postId: string) => {
+        await supabase.from('posts').delete().eq('id', postId);
+    },
+
+    likePost: async (userId: string, postId: string) => {
+        await supabase.from('likes').insert({ user_id: userId, post_id: postId });
+    },
+
+    unlikePost: async (userId: string, postId: string) => {
+        await supabase.from('likes').delete().match({ user_id: userId, post_id: postId });
+    },
+
+    createComment: async (comment: any) => {
+        await supabase.from('comments').insert({
+            user_id: comment.user_id,
+            post_id: comment.post_id,
+            content: comment.content
+        });
+    },
+
+    subscribeToSocialUpdates: (callback: () => void) => {
+        const channel = supabase.channel('public:social')
+            .on('postgres_changes', { event: '*', schema: 'public', table: 'posts' }, callback)
+            .on('postgres_changes', { event: '*', schema: 'public', table: 'likes' }, callback)
+            .on('postgres_changes', { event: '*', schema: 'public', table: 'comments' }, callback)
+            .subscribe();
+        return () => { supabase.removeChannel(channel); };
+    }
+};
+
+// --- MESSAGE SERVICE ---
+export const messageService = {
+    getMessages: async (user1: string, user2: string) => {
+        // If user2 is GLOBAL_BROADCAST, get all broadcast messages
+        if (user2 === 'GLOBAL_BROADCAST') {
+            const { data } = await supabase.from('messages')
+                .select('*')
+                .eq('is_broadcast', true)
+                .order('created_at', { ascending: true })
+                .limit(100);
+            return data || [];
+        }
+
+        const { data } = await supabase.from('messages')
+            .select('*')
+            .or(`and(sender_id.eq.${user1},receiver_id.eq.${user2}),and(sender_id.eq.${user2},receiver_id.eq.${user1})`)
+            .order('created_at', { ascending: true })
+            .limit(100);
+        return data || [];
+    },
+
+    sendMessage: async (msg: any) => {
+        const { error } = await supabase.from('messages').insert({
+            sender_id: msg.senderId,
+            receiver_id: msg.receiverId === 'GLOBAL_BROADCAST' ? null : msg.receiverId,
+            text: msg.text,
+            is_broadcast: msg.isBroadcast || false
+        });
+        if (error) throw error;
+    },
+
+    getAllUserConversations: async () => {
+        const { data: admin } = await supabase.from('profiles').select('id').eq('email', 'admin@blessed.ph').single();
+        if (!admin) return [];
+        
+        const { data: messages } = await supabase.from('messages')
+            .select('sender_id, receiver_id')
+            .or(`sender_id.eq.${admin.id},receiver_id.eq.${admin.id}`)
+            .order('created_at', { ascending: false });
+            
+        if (!messages) return [];
+        
+        const userIds = new Set<string>();
+        messages.forEach(m => {
+            if (m.sender_id !== admin.id) userIds.add(m.sender_id);
+            if (m.receiver_id !== admin.id) userIds.add(m.receiver_id);
+        });
+        
+        if (userIds.size === 0) return [];
+        
+        const { data: profiles } = await supabase.from('profiles').select('id, first_name, last_name').in('id', Array.from(userIds));
+        
+        return profiles?.map(p => ({
+            userId: p.id,
+            userName: `${p.first_name} ${p.last_name}`
+        })) || [];
+    },
+
+    subscribe: (callback: (payload?: any) => void) => {
+        const channel = supabase.channel('public:messages')
+            .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, callback)
+            .subscribe();
+        return () => { supabase.removeChannel(channel); };
+    }
+};
+
+// --- WALLET SERVICE ---
+export const walletService = {
+    getTransactions: async (userId?: string) => {
+        let query = supabase.from('wallet_transactions').select('*').order('created_at', { ascending: false }).limit(50);
+        if (userId) query = query.eq('user_id', userId);
+        const { data } = await query;
+        return data || [];
+    },
+
+    getTotalCirculatingSupply: async () => {
+        const { data } = await supabase.from('profiles').select('wallet_balance');
+        if (!data) return 0;
+        return data.reduce((acc, curr) => acc + (curr.wallet_balance || 0), 0);
+    },
+
+    createTransaction: async (tx: any, adminId?: string) => {
+        await supabase.from('wallet_transactions').insert({
+            ...tx,
+            admin_id: adminId
+        });
+    },
+
+    approveTransaction: async (tx: any, adminId: string) => {
+        await supabase.from('wallet_transactions').update({
+            status: 'APPROVED',
+            admin_id: adminId
+        }).eq('id', tx.id);
+
+        // Update balance based on type
+        if (tx.type === 'CASH_IN') {
+            const { data: profile } = await supabase.from('profiles').select('wallet_balance').eq('id', tx.user_id).single();
+            if (profile) {
+                await supabase.from('profiles').update({ wallet_balance: (profile.wallet_balance || 0) + tx.amount }).eq('id', tx.user_id);
+            }
+        } else if (tx.type === 'CASH_OUT') {
+            const { data: profile } = await supabase.from('profiles').select('wallet_balance').eq('id', tx.user_id).single();
+            if (profile) {
+                await supabase.from('profiles').update({ wallet_balance: (profile.wallet_balance || 0) - tx.amount }).eq('id', tx.user_id);
+            }
+        }
+    },
+    
+    rejectTransaction: async (txId: string, adminId: string) => {
+        await supabase.from('wallet_transactions').update({
+            status: 'REJECTED',
+            admin_id: adminId
+        }).eq('id', txId);
+    },
+
+    grantEmergencyFund: async (adminId: string, user: any, amount: number) => {
+        await walletService.createTransaction({
+            user_id: user.id,
+            user_name: `${user.first_name} ${user.last_name}`,
+            type: 'EMERGENCY_GRANT',
+            amount,
+            status: 'APPROVED',
+            reference_code: `EG-${Date.now()}`
+        }, adminId);
+        
+        // Update user balance
+        const { data: profile } = await supabase.from('profiles').select('wallet_balance').eq('id', user.id).single();
+        if (profile) {
+            await supabase.from('profiles').update({ wallet_balance: (profile.wallet_balance || 0) + amount }).eq('id', user.id);
+        }
+    },
+
+    massDeductEmergencyFund: async (amount: number, adminId: string, title?: string, desc?: string) => {
+        const { data: users } = await supabase.from('profiles').select('id, wallet_balance');
+        if (!users) return { totalDeducted: 0, userCount: 0 };
+        
+        let total = 0;
+        let count = 0;
+        
+        for (const u of users) {
+            if ((u.wallet_balance || 0) >= amount) {
+                await supabase.from('profiles').update({ wallet_balance: (u.wallet_balance || 0) - amount }).eq('id', u.id);
+                await walletService.createTransaction({
+                    user_id: u.id,
+                    type: 'EMERGENCY_DEDUCTION',
+                    amount,
+                    status: 'APPROVED',
+                    reference_code: `ED-MASS-${Date.now()}`,
+                    withdrawal_details: title
+                }, adminId);
+                total += amount;
+                count++;
+            }
+        }
+        return { totalDeducted: total, userCount: count };
+    },
+
+    requestCashIn: async (user: any, amount: number, referenceCode: string) => {
+        await walletService.createTransaction({
+            user_id: user.id,
+            user_name: `${user.first_name} ${user.last_name}`,
+            type: 'CASH_IN',
+            amount,
+            reference_code: referenceCode,
+            status: 'PENDING'
+        });
+    },
+
+    requestCashOut: async (user: any, amount: number, accountInfo: string) => {
+        await walletService.createTransaction({
+            user_id: user.id,
+            user_name: `${user.first_name} ${user.last_name}`,
+            type: 'CASH_OUT',
+            amount,
+            reference_code: accountInfo,
+            status: 'PENDING'
+        });
+    },
+
+    sendCoins: async (user: any, receiverCode: string, amount: number) => {
+        // Check balance
+        const { data: senderProfile } = await supabase.from('profiles').select('wallet_balance').eq('id', user.id).single();
+        if (!senderProfile || (senderProfile.wallet_balance || 0) < amount) throw new Error("Insufficient balance");
+
+        // Find receiver by wallet_code
+        const { data: receiverProfile } = await supabase.from('profiles').select('id, wallet_balance, first_name, last_name').eq('wallet_code', receiverCode).maybeSingle();
+        if (!receiverProfile) throw new Error("Recipient digital code not found.");
+        
+        const receiverId = receiverProfile.id;
+
+        // Deduct from sender
+        await supabase.from('profiles').update({ wallet_balance: (senderProfile.wallet_balance || 0) - amount }).eq('id', user.id);
+        
+        // Add to receiver
+        await supabase.from('profiles').update({ wallet_balance: (receiverProfile.wallet_balance || 0) + amount }).eq('id', receiverId);
+
+        // Record transaction for sender
+        await walletService.createTransaction({
+            user_id: user.id,
+            user_name: `${user.first_name} ${user.last_name}`,
+            target_user_id: receiverId,
+            target_user_name: `${receiverProfile.first_name} ${receiverProfile.last_name}`,
+            type: 'TRANSFER_SEND',
+            amount,
+            status: 'APPROVED',
+            reference_code: `TR-S-${Date.now()}`
+        });
+
+        // Record transaction for receiver
+        await walletService.createTransaction({
+            user_id: receiverId,
+            user_name: `${receiverProfile.first_name} ${receiverProfile.last_name}`,
+            target_user_id: user.id,
+            target_user_name: `${user.first_name} ${user.last_name}`,
+            type: 'TRANSFER_RECEIVE',
+            amount,
+            status: 'APPROVED',
+            reference_code: `TR-R-${Date.now()}`
+        });
+    },
+
+    subscribe: (callback: () => void) => {
+        const channel = supabase.channel('public:wallet')
+            .on('postgres_changes', { event: '*', schema: 'public', table: 'wallet_transactions' }, callback)
+            .subscribe();
+        return () => { supabase.removeChannel(channel); };
+    },
+    
+    grantRewardPoints: async (adminId: string, userId: string, points: number, orderId: string) => {
+        const { data: profile } = await supabase.from('profiles').select('wallet_balance').eq('id', userId).single();
+        if (profile) {
+            await supabase.from('profiles').update({ wallet_balance: (profile.wallet_balance || 0) + points }).eq('id', userId);
+        }
+        
+        await walletService.createTransaction({
+            user_id: userId,
+            type: 'PURCHASE_POINTS',
+            amount: points,
+            status: 'APPROVED',
+            reference_code: `REW-${orderId}`
+        }, adminId);
+    }
+};
+
+// --- STORAGE SERVICE ---
+export const storageService = {
+    uploadImage: async (file: File, bucketName: string = 'cms-assets') => {
+        const fileExt = file.name.split('.').pop();
+        const fileName = `${Math.random()}.${fileExt}`;
+        const { data: { user } } = await supabase.auth.getUser();
+        
+        // Ensure bucket name is valid, fallback to cms-assets if empty
+        const targetBucket = bucketName || 'cms-assets';
+        
+        // CMS assets should always be in a 'public/' folder for easier policy management
+        // regardless of who uploads them, so the public can always view them.
+        const filePath = `public/${fileName}`;
+
+        const { error: uploadError } = await supabase.storage.from(targetBucket).upload(filePath, file);
+        
+        if (uploadError) {
+            console.error("Supabase Storage Upload Error:", uploadError);
+            if (uploadError.message.includes('row-level security policy')) {
+                throw new Error("STORAGE POLICY ERROR: Your account has permission to log in, but NOT to upload files. You must enable 'INSERT' and 'SELECT' permissions for the 'authenticated' role on the '" + targetBucket + "' bucket in your Supabase Dashboard.");
+            }
+            throw uploadError;
+        }
+
+        const { data } = supabase.storage.from(targetBucket).getPublicUrl(filePath);
+        return data.publicUrl;
+    }
+};
+
+// CMS SERVICE was moved to the top to prevent ReferenceErrors
+
+// --- ECOMMERCE SERVICE ---
+export const ecommerceService = {
+    getProducts: async () => {
+        console.log("Fetching products from Supabase...");
+        const { data, error } = await supabase.from('products').select('*').limit(100);
+        if (error) {
+            console.error("Error fetching products:", error);
+            throw error;
+        }
+        console.log("Products fetched:", data);
+        return data || [];
+    },
+
+    saveProduct: async (product: any) => {
+        if (product.id) {
+            await supabase.from('products').update(product).eq('id', product.id);
+        } else {
+            const { error } = await supabase.from('products').insert(product);
+            if (error) {
+                console.error("Error inserting product:", error);
+                throw error;
+            }
+        }
+    },
+
+    deleteProduct: async (productId: string) => {
+        await supabase.from('products').delete().eq('id', productId);
+    },
+
+    getOrders: async (userId?: string) => {
+        let query = supabase.from('orders').select('*').order('created_at', { ascending: false }).limit(50);
+        if (userId) query = query.eq('user_id', userId);
+        const { data } = await query;
+        return (data || []).map(order => ({
+            ...order,
+            items: typeof order.items === 'string' ? JSON.parse(order.items) : order.items
+        }));
+    },
+
+    createOrder: async (order: any) => {
+        const { error } = await supabase.from('orders').insert({
+            ...order,
+            items: JSON.stringify(order.items)
+        });
+        if (error) throw error;
+
+        // If payment method is POINTS, deduct from wallet
+        if (order.payment_method === 'POINTS') {
+            const { data: profile } = await supabase.from('profiles').select('wallet_balance').eq('id', order.user_id).single();
+            if (profile) {
+                const newBalance = (profile.wallet_balance || 0) - order.total_amount;
+                await supabase.from('profiles').update({ wallet_balance: newBalance }).eq('id', order.user_id);
+                
+                // Record transaction
+                await walletService.createTransaction({
+                    user_id: order.user_id,
+                    user_name: order.user_name,
+                    type: 'MARKETPLACE_PURCHASE',
+                    amount: order.total_amount,
+                    status: 'APPROVED',
+                    reference_code: `ORD-${Date.now()}`
+                });
+            }
+        }
+    },
+
+    placeOrder: async (order: any) => {
+        return await ecommerceService.createOrder(order);
+    },
+
+    updateOrderStatus: async (order: any, status: string) => {
+        await supabase.from('orders').update({ status }).eq('id', order.id);
+    },
+
+    subscribeToOrders: (callback: () => void) => {
+        const channel = supabase.channel('public:orders')
+            .on('postgres_changes', { event: '*', schema: 'public', table: 'orders' }, callback)
+            .subscribe();
+        return () => { supabase.removeChannel(channel); };
+    }
+};
+
+// --- PAYOUT SERVICE ---
+export const payoutService = {
+    getPayouts: async () => {
+        const { data } = await supabase.from('payouts').select('*').order('created_at', { ascending: false }).limit(50);
+        return data || [];
+    },
+
+    getPayoutsForUser: async (userId: string) => {
+        const { data } = await supabase.from('payouts').select('*').eq('user_id', userId).order('created_at', { ascending: false }).limit(20);
+        return data || [];
+    },
+
+    requestPayout: async (payout: any) => {
+        // Deduct balance immediately
+        const { data: profile } = await supabase.from('profiles').select('wallet_balance').eq('id', payout.userId).single();
+        if (!profile || (profile.wallet_balance || 0) < payout.amount) throw new Error("Insufficient balance");
+        
+        await supabase.from('profiles').update({ wallet_balance: (profile.wallet_balance || 0) - payout.amount }).eq('id', payout.userId);
+        
+        await supabase.from('payouts').insert({
+            user_id: payout.userId,
+            user_name: payout.userName,
+            amount: payout.amount,
+            account_number: payout.accountNumber,
+            chapter: payout.chapter,
+            id_url: payout.idUrl,
+            status: 'PENDING'
+        });
+
+        // Record transaction
+        await walletService.createTransaction({
+            user_id: payout.userId,
+            user_name: payout.userName,
+            type: 'CASH_OUT',
+            amount: payout.amount,
+            status: 'PENDING',
+            reference_code: `PO-${Date.now()}`
+        });
+    },
+
+    rejectPayout: async (id: string, reason: string) => {
+        const { data: payout } = await supabase.from('payouts').select('*').eq('id', id).single();
+        if (!payout) return;
+
+        await supabase.from('payouts').update({ status: 'REJECTED', message: reason }).eq('id', id);
+
+        // Refund balance
+        const { data: profile } = await supabase.from('profiles').select('wallet_balance').eq('id', payout.user_id).single();
+        if (profile) {
+            await supabase.from('profiles').update({ wallet_balance: (profile.wallet_balance || 0) + payout.amount }).eq('id', payout.user_id);
+        }
+    },
+
+    approvePayout: async (id: string, proofUrl: string, message: string) => {
+        await supabase.from('payouts').update({
+            status: 'APPROVED',
+            admin_proof_url: proofUrl,
+            message
+        }).eq('id', id);
+    },
+
+    subscribe: (callback: () => void) => {
+        const channel = supabase.channel('public:payouts')
+            .on('postgres_changes', { event: '*', schema: 'public', table: 'payouts' }, callback)
+            .subscribe();
+        return () => { supabase.removeChannel(channel); };
+    }
+};
+
+// --- UPGRADE SERVICE ---
+export const upgradeService = {
+    getUpgradeRequests: async () => {
+        const { data } = await supabase.from('upgrade_requests').select('*').order('created_at', { ascending: false }).limit(50);
+        return data || [];
+    },
+
+    requestUpgrade: async (userId: string, userName: string, proofUrl: string) => {
+        await supabase.from('upgrade_requests').insert({
+            user_id: userId,
+            user_name: userName,
+            proof_url: proofUrl,
+            status: 'PENDING'
+        });
+    },
+
+    approveUpgrade: async (requestId: string, userId: string) => {
+        await supabase.from('upgrade_requests').update({ status: 'APPROVED' }).eq('id', requestId);
+        await supabase.from('profiles').update({ is_exclusive: true, membership_status: 'Exclusive' }).eq('id', userId);
+    },
+
+    rejectUpgrade: async (requestId: string) => {
+        await supabase.from('upgrade_requests').update({ status: 'REJECTED' }).eq('id', requestId);
+    },
+
+    subscribe: (callback: () => void) => {
+        const channel = supabase.channel('public:upgrades')
+            .on('postgres_changes', { event: '*', schema: 'public', table: 'upgrade_requests' }, callback)
+            .subscribe();
+        return () => { supabase.removeChannel(channel); };
+    }
+};
+
+// --- NOTIFICATION SERVICE ---
+export const notificationService = {
+    getNotifications: async (userId: string) => {
+        const { data } = await supabase.from('notifications').select('*').eq('user_id', userId).order('created_at', { ascending: false }).limit(20);
+        return data || [];
+    },
+    
+    markAsRead: async (id: string) => {
+        await supabase.from('notifications').update({ is_read: true }).eq('id', id);
+    },
+    
+    subscribe: (userId: string, callback: (payload?: any) => void) => {
+        const channel = supabase.channel(`public:notifications:${userId}`)
+            .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'notifications', filter: `user_id=eq.${userId}` }, callback)
+            .subscribe();
+        return () => { supabase.removeChannel(channel); };
+    }
+};
